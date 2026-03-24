@@ -1,0 +1,59 @@
+[
+    {
+        "battery_id": "battery-demo-sft-001",
+        "label": "电池故障",
+        "reason": "第1次充电存在过充现象，最高功率持续时间过长，后续两次充电依旧如此，最近一次充电涓流阶段时间过长，表现出持续异常。",
+        "charging_process": [
+            {
+                "process_id": "process_1",
+                "charge_start_time": "2026-03-01T08:00:00",
+                "charge_end_time": "2026-03-01T09:00:00",
+                "current_series": [
+                    0.1,
+                    0.2,
+                    0.4
+                ],
+                "voltage_series": [
+                    220,
+                    215,
+                    223.34
+                ],
+                "power_series": [
+                    22,
+                    43,
+                    48
+                ],
+                "charge_capacity": [
+                    0.05,
+                    0.09,
+                    0.11
+                ]
+            },
+            {
+                "process_id": "process_2",
+                "charge_start_time": "2026-03-02T08:00:00",
+                "charge_end_time": "2026-03-02T09:05:00",
+                "current_series": [
+                    0.11,
+                    0.21,
+                    0.39
+                ],
+                "voltage_series": [
+                    221,
+                    216,
+                    224.1
+                ],
+                "power_series": [
+                    23,
+                    44,
+                    49
+                ],
+                "charge_capacity": [
+                    0.06,
+                    0.1,
+                    0.12
+                ]
+            }
+        ]
+    }
+]

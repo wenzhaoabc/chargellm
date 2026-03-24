@@ -1,0 +1,1 @@
+{"battery_id":"...","label":"电池故障/电池老化/非标电池/正常","charging_process":[{"process_id":"...","charge_start_time":"...","charge_end_time":"...","current_series":[0.1,0.2,0.4],"voltage_series":[220,215,223.34],"power_series":[22,43,48],"charge_capacity":[0.05,0.09,0.11]}]}
