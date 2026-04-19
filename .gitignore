@@ -25,10 +25,16 @@ env/
 # Local configuration
 .env
 .env.*
+!.env.example
+!**/.env.example
 
 # Build artifacts
 build/
 dist/
+node_modules/
+playwright-report/
+test-results/
+backend/data/
 
 # Training artifacts and caches
 artifacts/

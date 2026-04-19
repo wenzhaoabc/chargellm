@@ -1,109 +1,71 @@
 # ChargeLLM
 
-Battery diagnosis with a TS-LLM pipeline for charging-history understanding, structured diagnosis, SFT, and GRPO.
+电动自行车电池健康诊断大模型项目仓库。仓库按三个同级项目组织：AI 模型训练、前端应用、后端服务；部署与 CI/CD 作为仓库级工程资产统一维护。
 
-基于时序编码与LLM的面向电池充电历史理解、结构化诊断的 TS-LLM 项目。
+## 目录结构
 
-## Readme
+```text
+chargellm/
+  model-training/   # AI 模型训练、数据契约、SFT/GRPO、推理验证
+  frontend/         # React + Vite 前端应用
+  backend/          # FastAPI 后端服务、认证、对话、数据源、管理接口
+  deploy/           # Docker Compose、Nginx、镜像构建文件
+  docs/             # 仓库级文档，包含 CI/CD 与历史归档
+  .github/          # GitHub Actions 与仓库协作配置
+```
 
-- 中文文档: [README.zh-CN.md](README.zh-CN.md)
-- English documentation: [README.en.md](README.en.md)
+## 快速启动
 
-## Quick Start
-
-1. Create a Python environment and install dependencies.
+后端：
 
 ```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+cp .env.example .env
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+前端：
+
+```bash
+cd frontend
+npm ci
+npm run dev -- --host 0.0.0.0 --port 5173
+```
+
+模型训练：
+
+```bash
+cd model-training
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install -e .
-```
-
-2. Prepare a local Qwen checkpoint directory and pass it explicitly when running training or inference.
-
-```bash
-python -m chargellm.training.train_sft --dataset-view --data-path dataset/sft.json --model-name-or-path models/Qwen3-0.6B
-```
-
-3. Run the test suite.
-
-```bash
 pytest
 ```
 
-4. Optionally generate additional synthetic datasets.
+容器部署：
 
 ```bash
-python scripts/generate_synthetic_data.py
+cd deploy
+docker compose up --build
 ```
 
-5. Run a one-step SFT smoke training.
+## 子项目文档
 
-```bash
-python -m chargellm.training.train_sft \
-	--train \
-	--data-path dataset/sft.json \
-	--model-name-or-path models/Qwen3-0.6B \
-	--output-dir artifacts/sft-smoke \
-	--batch-size 1 \
-	--epochs 1 \
-	--max-steps 1
-```
+- 模型训练：[model-training/README.md](model-training/README.md)
+- 后端服务：[backend/README.md](backend/README.md)
+- 前端应用：[frontend/README.md](frontend/README.md)
+- 统一 CI/CD：[docs/ci-cd.md](docs/ci-cd.md)
 
-6. Run a one-step GRPO smoke training from the SFT checkpoint.
+## 配置说明
 
-```bash
-python -m chargellm.training.train_grpo \
-	--train \
-	--data-path dataset/grpo.json \
-	--model-name-or-path models/Qwen3-0.6B \
-	--checkpoint-dir artifacts/sft-smoke \
-	--output-dir artifacts/grpo-smoke \
-	--batch-size 1 \
-	--epochs 1 \
-	--max-steps 1
-```
-
-7. Run demo inference with the saved checkpoint.
-
-```bash
-python -m chargellm.inference.infer_demo \
-	--data-path dataset/sft.json \
-	--index 0 \
-	--model-name-or-path models/Qwen3-0.6B \
-	--checkpoint-dir artifacts/sft-smoke
-```
-
-## Quick Links
-
-- Architecture: [docs/architecture.md](docs/architecture.md)
-- Data contract: [docs/data_contract.md](docs/data_contract.md)
-- SFT and GRPO plan: [docs/sft_grpo_plan.md](docs/sft_grpo_plan.md)
-- Testing strategy: [docs/testing_strategy.md](docs/testing_strategy.md)
-
-## Datasets
-
-- Base SFT samples: `dataset/sft.json`
-- Base GRPO samples: `dataset/grpo.json`
-- Synthetic SFT samples: `dataset/synthetic_sft.json`
-- Synthetic GRPO samples: `dataset/synthetic_grpo.json`
-- Synthetic raw jsonl: `dataset/synthetic_origin.jsonl`
-
-## Synthetic Data
-
-Generate synthetic battery charging histories with:
-
-```bash
-python scripts/generate_synthetic_data.py
-```
-
-The generated data satisfies:
-
-- 2 to 6 hours per charging process
-- 1-minute sampling interval
-- coherent current, voltage, power, and cumulative charge trajectories
-- battery-level labels with multi-process histories
-
+- 后端运行配置放在 `backend/.env`，模板为 `backend/.env.example`。
+- 前端运行配置放在 `frontend/.env`，模板为 `frontend/.env.example`。
+- `backend/.env.example` 不保存真实密钥，接入真实 VLLM 时需要在本地或部署环境写入 `VLLM_BASE_URL`、`VLLM_MODEL`、`VLLM_API_KEY`。
+- 训练产物、模型权重、本地数据库、前端依赖与构建结果已在 `.gitignore` 中排除，不应提交到仓库。
 

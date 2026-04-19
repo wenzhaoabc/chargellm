@@ -1,0 +1,23 @@
+sandbox_mode = "danger-full-access"
+approval_policy = "on-request"
+
+[sandbox_workspace_write]
+network_access = true
+writable_roots = [
+    "/root/autodl-tmp/tr/chargellm",
+]
+
+
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"
+env_http_headers = { "CONTEXT7_API_KEY" = "CONTEXT7_API_KEY" }
+enabled = true
+
+[mcp_servers.serena]
+startup_timeout_sec = 15
+command = "serena"
+args = ["start-mcp-server", "--project-from-cwd", "--context=codex"]
+enabled = true
+
+[features]
+multi_agent = true
