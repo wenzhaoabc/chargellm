@@ -46,3 +46,12 @@ models/
 # Notebook and logs
 *.ipynb_checkpoints
 *.log
+
+# Misc
+*.bak
+*.tmp
+*.swp
+*.swo
+
+# AI
+.vibe
