@@ -286,6 +286,57 @@ def delete_dataset(db: Session, dataset: BatteryExample) -> None:
     db.commit()
 
 
-def import_dataset_from_mysql(*, phone: str, start_time: str, end_time: str, title: str | None = None) -> BatteryExample:
-    _ = (phone, start_time, end_time, title)
-    raise NotImplementedError("external_mysql_query_not_configured")
+def import_dataset_from_mysql(
+    db: Session,
+    *,
+    phone: str,
+    start_time: str,
+    end_time: str,
+    title: str | None = None,
+) -> BatteryExample:
+    """Import a user's charge orders from MySQL into the local dataset table.
+
+    All of the user's orders in the window are collapsed into a single
+    BatteryExample row whose ``payload_json`` holds the full orders array.
+    This lets admins preview real user data without granting users direct
+    access to the IOT DB.
+    """
+    from datetime import datetime
+
+    from app.services.charging_data_service import query_charge_orders_by_phone
+
+    def _parse(ts: str) -> datetime | None:
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+
+    orders = query_charge_orders_by_phone(
+        phone,
+        start_time=_parse(start_time),
+        end_time=_parse(end_time),
+    )
+    if not orders:
+        raise ValueError("no_orders_found")
+
+    first = orders[0]
+    aggregate_series = {
+        "time_offset_min": first.series.time_offset_min,
+        "powers": first.series.powers,
+        "voltages": [0.0 if v is None else v for v in first.series.voltages],
+        "currents": [0.0 if v is None else v for v in first.series.currents],
+        "orders": [order.to_dict() for order in orders],
+    }
+    return create_dataset(
+        db,
+        title=title or f"MySQL Import {phone[-4:]} ({len(orders)} 单)",
+        problem_type="待诊断",
+        capacity_range="待评估",
+        description=f"由管理员从 IOT MySQL 导入的真实充电数据（手机号脱敏 {phone[:3]}****{phone[-4:]}）",
+        series=aggregate_series,
+        source="mysql_import",
+        sort_order=0,
+        is_active=True,
+    )

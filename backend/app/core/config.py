@@ -73,6 +73,12 @@ class Settings:
     vllm_base_url: str = field(default_factory=lambda: _env("VLLM_BASE_URL", default="http://127.0.0.1:8001/v1"))
     vllm_model: str = field(default_factory=lambda: _env("VLLM_MODEL", default="Qwen3-VL"))
     vllm_api_key: str = field(default_factory=lambda: _env("VLLM_API_KEY", default=""))
+    iot_db_url: str = field(default_factory=lambda: _env("IOT_DB_URL", default=""))
+    aliyun_access_key_id: str = field(default_factory=lambda: _env("ALIYUN_ACCESS_KEY_ID", default=""))
+    aliyun_access_key_secret: str = field(default_factory=lambda: _env("ALIYUN_ACCESS_KEY_SECRET", default=""))
+    aliyun_content_safety_endpoint: str = field(default_factory=lambda: _env("ALIYUN_CONTENT_SAFETY_ENDPOINT", default=""))
+    aliyun_region_id: str = field(default_factory=lambda: _env("ALIYUN_REGION_ID", default="cn-shanghai"))
+    jwt_secret: str = field(default_factory=lambda: _env("JWT_SECRET", default="change-me"))
 
 
 @lru_cache(maxsize=1)

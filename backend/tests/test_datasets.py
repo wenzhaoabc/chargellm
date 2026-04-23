@@ -191,19 +191,23 @@ def test_admin_can_manage_professional_datasets(client):
     assert delete_response.json()["status"] == "deleted"
 
 
-def test_admin_mysql_import_reports_unconfigured_connector(client):
+def test_admin_mysql_import_returns_no_orders_for_unknown_phone(client):
+    """A phone with no charge orders in IOT MySQL should fail cleanly with 400."""
     headers = _admin_headers(client)
 
     response = client.post(
         "/api/admin/datasets/mysql-import",
         headers=headers,
         json={
-            "phone": "13800000000",
-            "start_time": "2026-04-18T00:00:00",
-            "end_time": "2026-04-18T23:59:59",
+            "phone": "00000000000",  # not a real user
+            "start_time": "2020-01-01T00:00:00",
+            "end_time": "2020-01-02T00:00:00",
             "title": "平台抽取样本",
         },
     )
 
-    assert response.status_code == 501
-    assert response.json()["detail"] == "external_mysql_query_not_configured"
+    # 400 = no_orders_found (real DB queried, returned empty)
+    # 503 = iot_db_url not configured in this test env (also acceptable)
+    assert response.status_code in (400, 503)
+    detail = response.json()["detail"]
+    assert detail in {"no_orders_found", "iot_db_url_not_configured"}

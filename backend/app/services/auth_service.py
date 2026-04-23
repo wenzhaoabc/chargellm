@@ -34,20 +34,25 @@ def authenticate_admin(db: Session, username: str, password: str) -> User | None
 
 
 def send_sms_code(phone: str, mock_code: str) -> dict[str, str]:
+    """Legacy mock helper retained only for tests/back-compat."""
     return {"phone_masked": mask_phone(phone), "mock_code": mock_code}
+
+
+def ensure_user_for_phone(db: Session, phone: str) -> User:
+    """Find or create the User record for a verified phone (used by SMS login)."""
+    user = db.scalar(select(User).where(User.phone == phone))
+    if user is None:
+        user = User(phone=phone, role="user", is_active=True)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
 
 
 def authenticate_sms_user(db: Session, phone: str, code: str, mock_code: str) -> User | None:
     if code != mock_code:
         return None
-    user = db.scalar(select(User).where(User.phone == phone))
-    if user:
-        return user
-    user = User(phone=phone, role="user", is_active=True)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
+    return ensure_user_for_phone(db, phone)
 
 
 def issue_phone_access_token(phone: str) -> str:

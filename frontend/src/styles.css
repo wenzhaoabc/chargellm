@@ -170,8 +170,42 @@ small {
 }
 
 .conversation-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  position: relative;
+}
+
+.conversation-chip-main {
+  flex: 1 1 auto;
   display: grid;
   gap: 4px;
+  background: transparent;
+  border: 0;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+  padding: 0;
+  font: inherit;
+  min-width: 0;
+}
+
+.conversation-chip-title {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conversation-chip-menu {
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.conversation-chip:hover .conversation-chip-menu,
+.conversation-chip.active .conversation-chip-menu {
+  opacity: 1;
 }
 
 .conversation-chip small,

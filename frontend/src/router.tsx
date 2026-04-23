@@ -1,15 +1,15 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { getAdminToken } from '@/api/admin'
 import { AppShell } from '@/components/AppShell'
+import { AdminLayout } from '@/admin/AdminLayout'
 import { AdminLoginPage } from '@/pages/AdminLoginPage'
-import { AdminPage } from '@/pages/AdminPage'
 import { ChatPage } from '@/pages/ChatPage'
 import { HistoryPage } from '@/pages/HistoryPage'
 import { LandingPage } from '@/pages/LandingPage'
 import { RecordsPage } from '@/pages/RecordsPage'
 
 function AdminRoute() {
-  return getAdminToken() ? <AdminPage /> : <AdminLoginPage />
+  return getAdminToken() ? <AdminLayout /> : <AdminLoginPage />
 }
 
 export function AppRouter() {

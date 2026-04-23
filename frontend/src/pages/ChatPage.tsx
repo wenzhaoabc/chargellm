@@ -1,8 +1,21 @@
-import type { FormEvent } from 'react'
-import { useEffect, useRef, useState } from 'react'
-import { ChargeChart } from '@/components/ChargeChart'
-import { getInviteCode, getInviteSessionToken, hasInviteAccess } from '@/api/auth'
-import { runChatStream } from '@/api/chat'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  App,
+  Avatar,
+  Button,
+  Empty,
+  Layout,
+  Modal,
+  Space,
+  Spin,
+  Splitter,
+  Tag,
+  Typography,
+} from 'antd'
+import { Bubble, Sender } from '@ant-design/x'
+import { ClearOutlined, RobotOutlined, UserOutlined, WarningFilled } from '@ant-design/icons'
+import { generateChatTitle, streamAgentChat, type AgentChatMessage, type AgentEvent } from '@/api/agentChat'
+import type { ChargeOrder } from '@/api/chargeOrders'
 import {
   NEW_CONVERSATION_EVENT,
   OPEN_CONVERSATION_EVENT,
@@ -10,684 +23,469 @@ import {
   createConversationId,
   getActiveConversationId,
   getConversationById,
-  notifyConversationHistoryChanged,
   setActiveConversationId,
-  type ConversationRecord,
-  type ConversationTurnRecord,
+  setConversationChatSessionId,
+  updateConversationTitle,
 } from '@/api/conversations'
-import { listDatasets, uploadDataset } from '@/api/datasets'
-import type { BatteryExample, ChatCompletionMessage, ChatEvent, DiagnosisResult } from '@/api/types'
+import { ChargeChartECharts, type ChargeHighlight } from '@/components/ChargeChartECharts'
+import { MarkdownView } from '@/components/MarkdownView'
+import { PhoneSearchPanel } from '@/components/PhoneSearchPanel'
+import { ToolCallCard, type ToolInvocation } from '@/components/ToolCallCard'
 
-type ChatTurn = {
+type UiMessage = {
   id: string
-  question: string
-  battery: BatteryExample
-  events: ChatEvent[]
-  result: DiagnosisResult | null
-  pending: boolean
+  role: 'user' | 'assistant'
+  text: string
+  toolInvocations: ToolInvocation[]
+  // Highlights captured from highlight_charge_segment tool calls, grouped by
+  // order_no so we can render an inline chart for each affected order.
+  highlightsByOrder: Record<string, ChargeHighlight[]>
+  blocked?: { stage: string; reason: string; label?: string }
+  status?: 'streaming' | 'done' | 'error'
 }
 
-const promptChips = ['这份数据反映了什么健康风险？', '哪些充电过程最值得复核？', '请给出面向监管或运营的诊断摘要']
+const CONTEXT_KEY = 'chargellm.chat.context'
 
-async function readFileContent(file: File): Promise<string> {
-  if (typeof file.text === 'function') {
-    return file.text()
-  }
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result ?? ''))
-    reader.onerror = () => reject(reader.error ?? new Error('file_read_failed'))
-    reader.readAsText(file)
-  })
+type ChatContext = {
+  phone: string
+  phoneMasked: string
+  orders: ChargeOrder[]
 }
 
-function getAssistantText(turn: ChatTurn) {
-  return turn.events
-    .filter((event) => event.type === 'token')
-    .map((event) => event.message)
-    .join('')
+function newId() {
+  return `m_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 }
 
-function tryParseStructuredAnswer(text: string): { answer: string; diagnosis?: Partial<DiagnosisResult> } | null {
-  const trimmed = text.trim()
-  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
-    return null
-  }
+function loadContext(): ChatContext | null {
+  if (typeof window === 'undefined') return null
+  const raw = window.sessionStorage.getItem(CONTEXT_KEY)
+  if (!raw) return null
   try {
-    const parsed = JSON.parse(trimmed) as {
-      answer?: unknown
-      diagnosis?: {
-        label?: unknown
-        capacity_range?: unknown
-        capacityRange?: unknown
-        confidence?: unknown
-        reason?: unknown
-        key_processes?: unknown
-        keyProcesses?: unknown
-      }
-    }
-    if (typeof parsed.answer !== 'string' || !parsed.answer.trim()) {
-      return null
-    }
-    const diagnosis = parsed.diagnosis
-    return {
-      answer: parsed.answer,
-      diagnosis: diagnosis
-        ? {
-            label: typeof diagnosis.label === 'string' ? diagnosis.label : undefined,
-            capacityRange:
-              typeof diagnosis.capacityRange === 'string'
-                ? diagnosis.capacityRange
-                : typeof diagnosis.capacity_range === 'string'
-                  ? diagnosis.capacity_range
-                  : undefined,
-            confidence: typeof diagnosis.confidence === 'number' ? diagnosis.confidence : undefined,
-            reason: typeof diagnosis.reason === 'string' ? diagnosis.reason : undefined,
-            keyProcesses: Array.isArray(diagnosis.keyProcesses)
-              ? diagnosis.keyProcesses.map(String)
-              : Array.isArray(diagnosis.key_processes)
-                ? diagnosis.key_processes.map(String)
-                : undefined,
-          }
-        : undefined,
-    }
+    return JSON.parse(raw) as ChatContext
   } catch {
     return null
   }
 }
 
-function normalizeAssistantText(text: string) {
-  return tryParseStructuredAnswer(text)?.answer || text
-}
-
-function buildConversationMessages(turns: ChatTurn[], nextQuestion: string): ChatCompletionMessage[] {
-  const messages: ChatCompletionMessage[] = []
-  for (const turn of turns) {
-    messages.push({ role: 'user', content: turn.question })
-    const answer = getAssistantText(turn)
-    if (answer) {
-      messages.push({ role: 'assistant', content: answer })
-    }
-  }
-  messages.push({ role: 'user', content: [{ type: 'text', text: nextQuestion }] })
-  return messages
-}
-
-function fallbackDiagnosis(battery: BatteryExample, answer: string): DiagnosisResult {
-  const structured = tryParseStructuredAnswer(answer)
-  if (structured?.diagnosis) {
-    return {
-      label: structured.diagnosis.label || battery.label,
-      capacityRange: structured.diagnosis.capacityRange || battery.capacityRange,
-      confidence: structured.diagnosis.confidence ?? 0,
-      reason: structured.diagnosis.reason || structured.answer,
-      keyProcesses: structured.diagnosis.keyProcesses || (battery.highlightedProcessId ? [battery.highlightedProcessId] : []),
-    }
-  }
-  return {
-    label: battery.label,
-    capacityRange: battery.capacityRange,
-    confidence: 0,
-    reason: normalizeAssistantText(answer) || battery.shortSummary,
-    keyProcesses: battery.highlightedProcessId ? [battery.highlightedProcessId] : [],
-  }
-}
-
-function conversationToTurns(conversation: ConversationRecord): ChatTurn[] {
-  return conversation.turns.map((turn) => ({
-    id: turn.id,
-    question: turn.question,
-    battery: {
-      id: turn.batteryId || turn.batteryName,
-      name: turn.batteryName,
-      status: 'normal',
-      label: turn.batteryLabel,
-      capacityRange: turn.diagnosis.capacityRange,
-      shortSummary: turn.diagnosis.reason,
-      longSummary: turn.diagnosis.reason,
-      processCount: turn.diagnosis.keyProcesses.length,
-      highlightedProcessId: turn.diagnosis.keyProcesses[0] || '',
-      processes: [],
-    },
-    events: turn.answer ? [{ type: 'token', message: turn.answer }] : [],
-    result: turn.diagnosis,
-    pending: false,
-  }))
-}
-
-async function copyText(text: string) {
-  await navigator.clipboard?.writeText(text)
-}
-
-function AssistantMessage({
-  turn,
-  onCopy,
-  onRetry,
-}: {
-  turn: ChatTurn
-  onCopy: () => void
-  onRetry: () => void
-}) {
-  const streamedText = getAssistantText(turn)
-  const visibleText = normalizeAssistantText(streamedText)
-  const diagnosisReason = turn.result?.reason ? normalizeAssistantText(turn.result.reason) : ''
-  const shouldShowDiagnosisReason = Boolean(diagnosisReason && diagnosisReason !== visibleText)
-  const thoughtEvents = turn.events.filter((event) => event.type !== 'token' && event.type !== 'final')
-  const thoughtSummary = turn.pending ? '正在分析数据特征' : `已分析 ${thoughtEvents.length} 项数据特征`
-
-  return (
-    <article className="message-row assistant-row">
-      <div className="avatar assistant-avatar">AI</div>
-      <div className="message-stack">
-        {thoughtEvents.length > 0 ? (
-          <details className="tool-trace thinking-trace" open={turn.pending}>
-            <summary>{thoughtSummary}</summary>
-            <div className="stream-list">
-              {thoughtEvents.map((event, index) => (
-                <div key={`${event.type}-${index}`} className={`stream-row ${event.type === 'error' ? 'error' : ''}`}>
-                  <span className="thought-dot" aria-hidden="true" />
-                  <p>{event.message}</p>
-                </div>
-              ))}
-            </div>
-          </details>
-        ) : null}
-
-        <div className="assistant-bubble">
-          <p>{visibleText || (turn.pending ? '正在读取充电过程并生成诊断...' : '诊断已完成。')}</p>
-        </div>
-
-        {turn.result ? (
-          <details className="diagnosis-card" open>
-            <summary>
-              <span>诊断摘要</span>
-              <strong>{turn.result.label}</strong>
-            </summary>
-            <div className="diagnosis-grid">
-              <div className="metric-row">
-                <span>容量区间</span>
-                <strong>{turn.result.capacityRange}</strong>
-              </div>
-              <div className="metric-row">
-                <span>置信度</span>
-                <strong>{Math.round(turn.result.confidence * 100)}%</strong>
-              </div>
-            </div>
-            {shouldShowDiagnosisReason ? <p>{diagnosisReason}</p> : null}
-            <div className="tag-row">
-              {turn.result.keyProcesses.map((processId) => (
-                <span key={processId}>{processId}</span>
-              ))}
-            </div>
-          </details>
-        ) : null}
-
-        {!turn.pending && visibleText ? (
-          <div className="message-actions" aria-label="回答操作">
-            <button type="button" onClick={onCopy}>
-              复制回答
-            </button>
-            <button type="button" onClick={onRetry}>
-              重新生成
-            </button>
-          </div>
-        ) : null}
-      </div>
-    </article>
-  )
-}
-
-function DatasetButton({
-  battery,
-  active,
-  onSelect,
-}: {
-  battery: BatteryExample
-  active: boolean
-  onSelect: () => void
-}) {
-  return (
-    <button
-      className={`battery-option${active ? ' active' : ''}`}
-      type="button"
-      aria-label={`选择数据源：${battery.name}`}
-      onClick={onSelect}
-    >
-      <span>{battery.name}</span>
-      <strong>{battery.label}</strong>
-      <small>{battery.capacityRange} · {battery.source === 'user_upload' ? '我的导入数据' : '专业案例库'}</small>
-    </button>
-  )
-}
-
-function DataContextPanel({
-  datasets,
-  selectedBattery,
-  selectedProcess,
-  selectedProcessId,
-  datasetError,
-  onSelectDataset,
-  onSelectProcess,
-}: {
-  datasets: BatteryExample[]
-  selectedBattery?: BatteryExample
-  selectedProcess?: BatteryExample['processes'][number]
-  selectedProcessId: string
-  datasetError: string
-  onSelectDataset: (battery: BatteryExample) => void
-  onSelectProcess: (processId: string) => void
-}) {
-  return (
-    <div className="data-context-panel" role="region" aria-label="数据上下文">
-      <div className="data-context-panel-header">
-        <div>
-          <span className="eyebrow">数据上下文</span>
-          <h2>{selectedBattery?.name ?? '等待数据'}</h2>
-        </div>
-        <span>{selectedBattery?.source === 'user_upload' ? '我的导入数据' : '专业案例库'}</span>
-      </div>
-      <p>{selectedBattery?.longSummary ?? '输入邀请码后可以读取专业案例库，也可以导入 CSV 或 JSON 数据。'}</p>
-      {datasetError ? <div className="inline-info">{datasetError}</div> : null}
-
-      <div className="battery-list compact">
-        {datasets.map((battery) => (
-          <DatasetButton
-            key={battery.id}
-            battery={battery}
-            active={battery.id === selectedBattery?.id}
-            onSelect={() => onSelectDataset(battery)}
-          />
-        ))}
-      </div>
-
-      {selectedBattery && selectedProcess ? (
-        <div className="data-evidence-card">
-          <div className="section-header">
-            <div>
-              <span className="eyebrow">分析依据</span>
-              <h3>{selectedProcess.title}</h3>
-            </div>
-            <select value={selectedProcessId} onChange={(event) => onSelectProcess(event.target.value)}>
-              {selectedBattery.processes.map((process) => (
-                <option key={process.processId} value={process.processId}>
-                  {process.title}
-                </option>
-              ))}
-            </select>
-          </div>
-          <ChargeChart battery={selectedBattery} process={selectedProcess} />
-        </div>
-      ) : null}
-    </div>
-  )
+function saveContext(ctx: ChatContext | null) {
+  if (typeof window === 'undefined') return
+  if (ctx) window.sessionStorage.setItem(CONTEXT_KEY, JSON.stringify(ctx))
+  else window.sessionStorage.removeItem(CONTEXT_KEY)
 }
 
 export function ChatPage() {
-  const [datasets, setDatasets] = useState<BatteryExample[]>([])
-  const [selectedDatasetId, setSelectedDatasetId] = useState('')
-  const selectedBattery = datasets.find((dataset) => dataset.id === selectedDatasetId) ?? datasets[0]
-  const [selectedProcessId, setSelectedProcessId] = useState('')
-  const selectedProcess =
-    selectedBattery?.processes.find((process) => process.processId === selectedProcessId) ?? selectedBattery?.processes[0]
-  const [inviteCode] = useState(getInviteCode())
-  const [question, setQuestion] = useState(promptChips[0])
-  const [attachments, setAttachments] = useState<string[]>([])
-  const [turns, setTurns] = useState<ChatTurn[]>([])
-  const [conversationId, setConversationId] = useState(() => getActiveConversationId() || createConversationId())
-  const [pending, setPending] = useState(false)
-  const [datasetError, setDatasetError] = useState('')
-  const [contextOpen, setContextOpen] = useState(false)
-  const abortControllerRef = useRef<AbortController | null>(null)
-
-  const inviteUnlocked = hasInviteAccess()
-  const sessionToken = getInviteSessionToken()
+  const { message } = App.useApp()
+  const [context, setContext] = useState<ChatContext | null>(() => loadContext())
+  const [messages, setMessages] = useState<UiMessage[]>([])
+  const [draft, setDraft] = useState('')
+  const [streaming, setStreaming] = useState(false)
+  const [previewOrder, setPreviewOrder] = useState<ChargeOrder | null>(null)
+  // Conversation currently open on this page — persisted on each completed turn.
+  const [conversationId, setConversationId] = useState<string>(() => getActiveConversationId())
+  // Backend ChatSession id sent on the first `status` event of the stream.
+  const chatSessionIdRef = useRef<number | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  const scrollRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
-    setActiveConversationId(conversationId)
-    notifyConversationHistoryChanged()
-  }, [conversationId])
+    saveContext(context)
+  }, [context])
 
   useEffect(() => {
-    const openConversation = (event: Event) => {
-      const conversationId = (event as CustomEvent<{ conversationId: string }>).detail?.conversationId
-      if (!conversationId) {
-        return
-      }
-      const conversation = getConversationById(conversationId)
-      if (!conversation) {
-        return
-      }
-      setConversationId(conversation.id)
-      setTurns(conversationToTurns(conversation))
-      setQuestion('')
-      setAttachments([])
-      setPending(false)
-    }
-    const newConversation = () => {
-      handleNewConversation()
-    }
-    window.addEventListener(OPEN_CONVERSATION_EVENT, openConversation)
-    window.addEventListener(NEW_CONVERSATION_EVENT, newConversation)
-    const activeConversation = getConversationById(getActiveConversationId())
-    if (activeConversation) {
-      setConversationId(activeConversation.id)
-      setTurns(conversationToTurns(activeConversation))
-    }
-    return () => {
-      window.removeEventListener(OPEN_CONVERSATION_EVENT, openConversation)
-      window.removeEventListener(NEW_CONVERSATION_EVENT, newConversation)
-    }
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
+  }, [messages])
+
+  const resetConversationState = useCallback(() => {
+    setMessages([])
+    abortRef.current?.abort()
+    setStreaming(false)
+    chatSessionIdRef.current = null
   }, [])
 
+  // Listen to sidebar "new" / "open" events so the ChatPage can sync.
   useEffect(() => {
-    let active = true
-    listDatasets(sessionToken)
-      .then((items) => {
-        if (!active) {
-          return
-        }
-        setDatasets(items)
-        if (items[0]) {
-          setSelectedDatasetId(items[0].id)
-          setSelectedProcessId(items[0].highlightedProcessId)
-        }
-      })
-      .catch((error) => {
-        if (active) {
-          setDatasetError(error instanceof Error ? error.message : '数据读取失败')
-        }
-      })
-    return () => {
-      active = false
+    const onNew = () => {
+      resetConversationState()
+      setConversationId('')
     }
-  }, [sessionToken])
-
-  const selectDataset = (battery: BatteryExample) => {
-    setSelectedDatasetId(battery.id)
-    setSelectedProcessId(battery.highlightedProcessId)
-  }
-
-  const handleUpload = async (files: FileList | null) => {
-    const file = files?.[0]
-    if (!file || !inviteUnlocked || !sessionToken) {
-      return
-    }
-    setAttachments([file.name])
-    try {
-      const uploaded = await uploadDataset({
-        sessionToken,
-        name: file.name,
-        fileName: file.name,
-        content: await readFileContent(file),
-      })
-      setDatasets((current) => [uploaded, ...current])
-      selectDataset(uploaded)
-    } catch (error) {
-      setDatasetError(error instanceof Error ? error.message : '数据导入失败')
-    }
-  }
-
-  const handleNewConversation = () => {
-    const nextConversationId = createConversationId()
-    setTurns([])
-    setQuestion(promptChips[0])
-    setAttachments([])
-    setPending(false)
-    setConversationId(nextConversationId)
-    setActiveConversationId(nextConversationId)
-    notifyConversationHistoryChanged()
-  }
-
-  const runDiagnosisTurn = async (turnId: string, trimmedQuestion: string, battery: BatteryExample, replaceExisting: boolean) => {
-    if (!inviteUnlocked || pending) {
-      return
-    }
-    const streamedEvents: ChatEvent[] = []
-    let completedResult: DiagnosisResult | null = null
-    const historyTurns = replaceExisting ? turns.filter((turn) => turn.id !== turnId) : turns
-    const abortController = new AbortController()
-    abortControllerRef.current = abortController
-    setPending(true)
-    setActiveConversationId(conversationId)
-    notifyConversationHistoryChanged()
-    setTurns((current) => {
-      const nextTurn: ChatTurn = {
-        id: turnId,
-        question: trimmedQuestion,
-        battery,
-        events: [],
-        result: null,
-        pending: true,
+    const onOpen = (e: Event) => {
+      const target = (e as CustomEvent).detail?.conversationId as string | undefined
+      if (!target) return
+      const record = getConversationById(target)
+      if (!record) return
+      abortRef.current?.abort()
+      setStreaming(false)
+      chatSessionIdRef.current = record.chatSessionId ?? null
+      setConversationId(record.id)
+      // Reconstruct UiMessages from saved turns (each turn = user + assistant pair).
+      const restored: UiMessage[] = []
+      for (const turn of record.turns) {
+        restored.push({
+          id: `${turn.id}-u`,
+          role: 'user',
+          text: turn.question,
+          toolInvocations: [],
+          highlightsByOrder: {},
+          status: 'done',
+        })
+        restored.push({
+          id: `${turn.id}-a`,
+          role: 'assistant',
+          text: turn.answer,
+          toolInvocations: [],
+          highlightsByOrder: {},
+          status: 'done',
+        })
       }
-      return replaceExisting ? current.map((turn) => (turn.id === turnId ? nextTurn : turn)) : [...current, nextTurn]
-    })
+      setMessages(restored)
+    }
+    window.addEventListener(NEW_CONVERSATION_EVENT, onNew)
+    window.addEventListener(OPEN_CONVERSATION_EVENT, onOpen)
+    return () => {
+      window.removeEventListener(NEW_CONVERSATION_EVENT, onNew)
+      window.removeEventListener(OPEN_CONVERSATION_EVENT, onOpen)
+    }
+  }, [resetConversationState])
 
+  function onUseOrders(phone: string, orders: ChargeOrder[]) {
+    const phoneMasked = phone.length >= 7 ? `${phone.slice(0, 3)}****${phone.slice(-4)}` : phone
+    setContext({ phone, phoneMasked, orders })
+    message.success(`已加载 ${orders.length} 次充电记录到对话上下文`)
+  }
+
+  function onClear() {
+    resetConversationState()
+    setConversationId('')
+    setActiveConversationId('')
+  }
+
+  function buildHistory(currentMessages: UiMessage[]): AgentChatMessage[] {
+    const history: AgentChatMessage[] = []
+    for (const m of currentMessages) {
+      if (m.role === 'user') {
+        history.push({ role: 'user', content: m.text })
+      } else if (m.text.trim()) {
+        history.push({ role: 'assistant', content: m.text })
+      }
+    }
+    return history
+  }
+
+  async function send(text: string) {
+    const trimmed = text.trim()
+    if (!trimmed) return
+    if (!context) {
+      message.warning('请先在左侧搜索手机号并将充电记录送入对话')
+      return
+    }
+    // Materialize a conversation id on first send if missing.
+    let activeConvId = conversationId
+    if (!activeConvId) {
+      activeConvId = createConversationId()
+      setConversationId(activeConvId)
+      setActiveConversationId(activeConvId)
+    }
+    const isFirstTurn = messages.length === 0
+
+    const userMsg: UiMessage = {
+      id: newId(),
+      role: 'user',
+      text: trimmed,
+      toolInvocations: [],
+      highlightsByOrder: {},
+    }
+    const assistantMsg: UiMessage = {
+      id: newId(),
+      role: 'assistant',
+      text: '',
+      toolInvocations: [],
+      highlightsByOrder: {},
+      status: 'streaming',
+    }
+    setMessages((prev) => [...prev, userMsg, assistantMsg])
+    setDraft('')
+    setStreaming(true)
+
+    const history = buildHistory([...messages, userMsg])
+    const controller = new AbortController()
+    abortRef.current = controller
+
+    const ordersSummary = context.orders.map((o) => ({
+      order_no: o.order_no,
+      supplier_name: o.supplier_name,
+      charge_start_time: o.charge_start_time,
+      charge_end_time: o.charge_end_time,
+      charge_capacity: o.charge_capacity,
+      points: o.series.time_offset_min.length,
+    }))
+    const systemPrompt = `当前对话已绑定用户手机号 ${context.phone}（脱敏 ${context.phoneMasked}），已预先加载该用户最近 ${context.orders.length} 次充电订单：${JSON.stringify(ordersSummary)}。请基于跨订单趋势进行综合诊断；当需要明细数据时调用 query_charging_records 工具；如某次订单某段曲线明显异常请调用 highlight_charge_segment 让前端高亮显示。`
+
+    let doneStatus: AgentEvent['type'] | string = 'streaming'
     try {
-      await runChatStream(
+      await streamAgentChat(
+        { messages: history, user_phone: context.phone, system_prompt: systemPrompt, signal: controller.signal },
         {
-          batteryId: battery.id,
-          datasetId: battery.datasetId,
-          inviteCode,
-          question: trimmedQuestion,
-          messages: buildConversationMessages(historyTurns, trimmedQuestion),
-          signal: abortController.signal,
-        },
-        {
-          onEvent: (chatEvent) => {
-            streamedEvents.push(chatEvent)
-            setTurns((current) =>
-              current.map((turn) =>
-                turn.id === turnId
-                  ? {
-                      ...turn,
-                      events: [...turn.events, chatEvent],
-                      result:
-                        chatEvent.type === 'final' && chatEvent.payload
-                          ? (chatEvent.payload as DiagnosisResult)
-                          : turn.result,
-                    }
-                  : turn,
-              ),
-            )
+          onEvent: (evt) => {
+            applyEvent(assistantMsg.id, evt)
+            if (evt.type === 'status' && typeof evt.chat_session_id === 'number') {
+              chatSessionIdRef.current = evt.chat_session_id
+              setConversationChatSessionId(activeConvId, evt.chat_session_id)
+            }
+            if (evt.type === 'done') {
+              doneStatus = evt.status
+            }
           },
-          onFinal: (diagnosis) => {
-            completedResult = diagnosis
-            setTurns((current) =>
-              current.map((turn) => (turn.id === turnId ? { ...turn, result: diagnosis } : turn)),
-            )
-          },
-          onError: (message) => {
-            setTurns((current) =>
-              current.map((turn) =>
-                turn.id === turnId
-                  ? { ...turn, events: [...turn.events, { type: 'error', message }], pending: false }
-                  : turn,
-              ),
-            )
+          onError: (err) => {
+            applyEvent(assistantMsg.id, { type: 'error', message: err.message })
           },
         },
       )
-    } catch (error) {
-      if (!(error instanceof DOMException && error.name === 'AbortError')) {
-        const message = error instanceof Error ? error.message : '对话请求失败'
-        setTurns((current) =>
-          current.map((turn) =>
-            turn.id === turnId ? { ...turn, events: [...turn.events, { type: 'error', message }], pending: false } : turn,
-          ),
-        )
-      }
+    } catch (err) {
+      applyEvent(assistantMsg.id, { type: 'error', message: err instanceof Error ? err.message : String(err) })
     } finally {
-      const answer = streamedEvents
-        .filter((chatEvent) => chatEvent.type === 'token')
-        .map((chatEvent) => chatEvent.message)
-        .join('')
-      const visibleAnswer = normalizeAssistantText(answer)
-      if (!completedResult && answer) {
-        completedResult = fallbackDiagnosis(battery, answer)
-        setTurns((current) => current.map((turn) => (turn.id === turnId ? { ...turn, result: completedResult } : turn)))
+      setStreaming(false)
+      abortRef.current = null
+    }
+
+    // Persist this turn into sidebar history regardless of success/blocked so
+    // the user can revisit what happened.
+    const finalAssistantText = await new Promise<string>((resolve) => {
+      setMessages((prev) => {
+        const answer = prev.find((m) => m.id === assistantMsg.id)?.text || ''
+        resolve(answer)
+        return prev
+      })
+    })
+    appendConversationTurn(activeConvId, {
+      id: userMsg.id,
+      question: trimmed,
+      answer: finalAssistantText,
+      batteryName: context.phoneMasked,
+      batteryLabel: `${context.orders.length} 次充电`,
+    })
+
+    // Problem 5: on the first completed OK turn, ask the fast model for a title.
+    if (isFirstTurn && doneStatus === 'ok' && finalAssistantText.trim()) {
+      try {
+        const title = await generateChatTitle({
+          user_message: trimmed,
+          assistant_message: finalAssistantText,
+          chat_session_id: chatSessionIdRef.current,
+        })
+        if (title) updateConversationTitle(activeConvId, title)
+      } catch (err) {
+        // fall back silently to user-message-derived title
       }
-      if (completedResult) {
-        const record: ConversationTurnRecord = {
-          id: turnId,
-          batteryId: battery.id,
-          question: trimmedQuestion,
-          batteryName: battery.name,
-          batteryLabel: battery.label,
-          answer: visibleAnswer,
-          diagnosis: completedResult,
+    }
+  }
+
+  function applyEvent(messageId: string, evt: AgentEvent) {
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id !== messageId) return m
+        switch (evt.type) {
+          case 'token':
+            return { ...m, text: m.text + evt.text }
+          case 'tool_call':
+            return {
+              ...m,
+              toolInvocations: [
+                ...m.toolInvocations,
+                { id: evt.id, name: evt.name, arguments: evt.arguments },
+              ],
+            }
+          case 'tool_result': {
+            const toolInvocations = m.toolInvocations.map((t) =>
+              t.id === evt.id ? { ...t, result: evt } : t,
+            )
+            let highlightsByOrder = m.highlightsByOrder
+            if (evt.name === 'highlight_charge_segment' && !evt.is_error) {
+              const data = evt.data as Record<string, unknown>
+              const orderNo = String(data.order_no || '')
+              const highlight: ChargeHighlight = {
+                metric: (data.metric as ChargeHighlight['metric']) || 'power',
+                start_min: Number(data.start_min || 0),
+                end_min: Number(data.end_min || 0),
+                reason: String(data.reason || ''),
+                severity: (data.severity as ChargeHighlight['severity']) || 'warning',
+              }
+              highlightsByOrder = {
+                ...m.highlightsByOrder,
+                [orderNo]: [...(m.highlightsByOrder[orderNo] || []), highlight],
+              }
+            }
+            return { ...m, toolInvocations, highlightsByOrder }
+          }
+          case 'safety':
+            return {
+              ...m,
+              status: 'error',
+              blocked: { stage: evt.stage, reason: evt.reason, label: evt.label },
+            }
+          case 'error':
+            return { ...m, status: 'error', text: m.text + `\n\n> 错误: ${evt.message}` }
+          case 'done':
+            return { ...m, status: evt.status === 'ok' ? 'done' : 'error' }
+          default:
+            return m
         }
-        appendConversationTurn(conversationId, record)
-      }
-      if (abortControllerRef.current === abortController) {
-        abortControllerRef.current = null
-      }
-      setPending(false)
-      setQuestion('')
-      setTurns((current) => current.map((turn) => (turn.id === turnId ? { ...turn, pending: false } : turn)))
-    }
+      }),
+    )
   }
 
-  const handleAsk = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    const trimmedQuestion = question.trim()
-    if (!selectedBattery || !trimmedQuestion || !inviteUnlocked || pending) {
-      return
-    }
-
-    await runDiagnosisTurn(`${Date.now()}-${selectedBattery.id}`, trimmedQuestion, selectedBattery, false)
-  }
-
-  const handleRetry = async (turn: ChatTurn) => {
-    if (pending) {
-      return
-    }
-    await runDiagnosisTurn(turn.id, turn.question, turn.battery, true)
-  }
-
-  const handleStop = () => {
-    abortControllerRef.current?.abort()
-  }
-
-  const handleCopy = async (turn: ChatTurn) => {
-    const text = normalizeAssistantText(getAssistantText(turn)) || turn.result?.reason || ''
-    if (text) {
-      await copyText(text)
-    }
-  }
+  const ordersByNo = useMemo(() => {
+    const map: Record<string, ChargeOrder> = {}
+    context?.orders.forEach((o) => {
+      map[o.order_no] = o
+    })
+    return map
+  }, [context])
 
   return (
-    <div className="chat-product">
-      <section className="chat-main" aria-label="诊断对话">
-        <header className="chat-header">
-          <div>
-            <span className="eyebrow">Battery Health AI</span>
-            <h1>电池健康诊断 AI 助手</h1>
-          </div>
-          <div className="chat-header-actions">
-            {pending ? (
-              <button className="button secondary" type="button" onClick={handleStop}>
-                停止生成
-              </button>
-            ) : null}
-            <button className="button secondary" type="button" onClick={handleNewConversation} disabled={pending}>
-              新建对话
-            </button>
-            <span className={`session-pill ${inviteUnlocked ? 'ready' : 'locked'}`}>
-              {inviteUnlocked ? '已连接会话' : '等待邀请码'}
-            </span>
-          </div>
-        </header>
-
-        <div className="message-list">
-          {turns.length === 0 ? (
-            <div className="welcome-panel">
-              <span className="eyebrow">专业电池健康诊断</span>
-              <h2>今天想分析哪组电池数据？</h2>
-              <p>选择已有专业案例或导入 CSV/JSON，然后像使用 ChatGPT 一样直接提问。</p>
-              <div className="prompt-grid">
-                {promptChips.map((chip) => (
-                  <button key={chip} type="button" onClick={() => setQuestion(chip)}>
-                    {chip}
-                  </button>
-                ))}
+    <Layout style={{ height: 'calc(100vh - 64px)', background: '#fff' }}>
+      <Splitter style={{ height: '100%' }}>
+        <Splitter.Panel defaultSize={360} min={280} max={520}>
+          <div style={{ padding: 12, height: '100%', overflowY: 'auto' }}>
+            <PhoneSearchPanel onUseOrders={onUseOrders} />
+            {context && (
+              <div style={{ marginTop: 12 }}>
+                <Typography.Title level={5} style={{ marginBottom: 8 }}>
+                  当前用户充电曲线
+                </Typography.Title>
+                <Space direction="vertical" style={{ width: '100%' }} size={10}>
+                  {context.orders.map((o) => (
+                    <div
+                      key={o.order_no}
+                      style={{ border: '1px solid #f0f0f0', borderRadius: 8, padding: 8, cursor: 'pointer' }}
+                      onClick={() => setPreviewOrder(o)}
+                    >
+                      <Space size={6} wrap>
+                        <Typography.Text strong style={{ fontSize: 12 }}>{o.order_no}</Typography.Text>
+                        {o.supplier_name && <Tag>{o.supplier_name}</Tag>}
+                      </Space>
+                      <ChargeChartECharts order={o} height={140} compact />
+                    </div>
+                  ))}
+                </Space>
               </div>
-            </div>
-          ) : (
-            turns.map((turn) => (
-              <div key={turn.id} className="turn-block">
-                <article className="message-row user-row">
-                  <div className="user-bubble">
-                    <p>{turn.question}</p>
-                    <span>
-                      {turn.battery.name} · {turn.battery.label}
-                    </span>
-                  </div>
-                  <div className="avatar user-avatar">你</div>
-                </article>
-                <AssistantMessage turn={turn} onCopy={() => void handleCopy(turn)} onRetry={() => void handleRetry(turn)} />
-              </div>
-            ))
-          )}
-        </div>
-
-        <div className="composer">
-          {!inviteUnlocked ? <div className="composer-hint">请先在产品介绍页输入邀请码，再进入诊断对话。</div> : null}
-          <div className="context-strip">
-            <button
-              className="context-toggle"
-              type="button"
-              aria-expanded={contextOpen}
-              onClick={() => setContextOpen((open) => !open)}
+            )}
+          </div>
+        </Splitter.Panel>
+        <Splitter.Panel>
+          <Layout style={{ height: '100%', background: '#fff' }}>
+            <Layout.Header
+              style={{
+                background: '#fff',
+                borderBottom: '1px solid #f0f0f0',
+                padding: '0 16px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                height: 52,
+              }}
             >
-              <span>当前数据：{selectedBattery?.name ?? '等待数据'}</span>
-              <small>
-                {selectedBattery
-                  ? `${selectedBattery.label} · ${selectedBattery.source === 'user_upload' ? '我的导入数据' : '专业案例库'}`
-                  : '邀请码通过后加载'}
-              </small>
-            </button>
-          </div>
-          {contextOpen ? (
-            <DataContextPanel
-              datasets={datasets}
-              selectedBattery={selectedBattery}
-              selectedProcess={selectedProcess}
-              selectedProcessId={selectedProcess?.processId ?? selectedProcessId}
-              datasetError={datasetError}
-              onSelectDataset={selectDataset}
-              onSelectProcess={setSelectedProcessId}
-            />
-          ) : null}
-          <form className="composer-surface" onSubmit={handleAsk}>
-            <label className="attach-button" role="button" aria-label="添加图片或文件" tabIndex={0}>
-              <input
-                aria-label="添加图片或文件"
-                type="file"
-                accept=".csv,.json"
-                onChange={(event) => void handleUpload(event.target.files)}
+              <Space>
+                <Typography.Title level={5} style={{ margin: 0 }}>
+                  ChargeLLM 智能诊断
+                </Typography.Title>
+                {context && <Tag color="blue">{context.phoneMasked}</Tag>}
+              </Space>
+              <Button icon={<ClearOutlined />} size="small" onClick={onClear} disabled={messages.length === 0}>
+                清空对话
+              </Button>
+            </Layout.Header>
+            <Layout.Content
+              ref={scrollRef as never}
+              style={{ padding: 16, overflowY: 'auto', background: '#fafafa' }}
+            >
+              {messages.length === 0 ? (
+                <Empty
+                  description={context ? '直接提问，例如：请分析这位用户的电池健康状况' : '请先在左侧搜索一个手机号'}
+                />
+              ) : (
+                <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                  {messages.map((m) => renderMessage(m, ordersByNo))}
+                </Space>
+              )}
+            </Layout.Content>
+            <Layout.Footer style={{ padding: 12, background: '#fff', borderTop: '1px solid #f0f0f0' }}>
+              <Sender
+                value={draft}
+                onChange={setDraft}
+                onSubmit={send}
+                loading={streaming}
+                onCancel={() => abortRef.current?.abort()}
+                placeholder={context ? '请输入问题…' : '请先在左侧搜索手机号'}
+                disabled={!context}
               />
-              <span>+</span>
-            </label>
-            <textarea
-              value={question}
-              onChange={(event) => setQuestion(event.target.value)}
-              placeholder={inviteUnlocked ? '询问电池老化、故障、容量区间或异常充电过程' : '输入邀请码后开始诊断'}
-              rows={2}
-              disabled={!inviteUnlocked || pending}
-            />
-            <button type="submit" disabled={!inviteUnlocked || pending || !question.trim() || !selectedBattery}>
-              {pending ? '分析中' : '发送'}
-            </button>
-          </form>
-          {attachments.length > 0 ? (
-            <div className="attachment-strip">
-              {attachments.map((name) => (
-                <span key={name}>{name}</span>
-              ))}
-            </div>
-          ) : null}
+            </Layout.Footer>
+          </Layout>
+        </Splitter.Panel>
+      </Splitter>
+      <Modal
+        open={Boolean(previewOrder)}
+        onCancel={() => setPreviewOrder(null)}
+        footer={null}
+        width={840}
+        title={previewOrder ? `订单 ${previewOrder.order_no}` : ''}
+      >
+        {previewOrder && <ChargeChartECharts order={previewOrder} height={420} />}
+      </Modal>
+    </Layout>
+  )
+}
+
+function renderMessage(m: UiMessage, ordersByNo: Record<string, ChargeOrder>) {
+  if (m.role === 'user') {
+    return (
+      <Bubble
+        key={m.id}
+        placement="end"
+        avatar={<Avatar icon={<UserOutlined />} style={{ background: '#1677ff' }} />}
+        content={<Typography.Text>{m.text}</Typography.Text>}
+      />
+    )
+  }
+  const charts = Object.entries(m.highlightsByOrder)
+    .map(([orderNo, highlights]) => {
+      const order = ordersByNo[orderNo]
+      if (!order) return null
+      return (
+        <div key={orderNo} style={{ marginTop: 10 }}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            订单 {orderNo} 异常高亮
+          </Typography.Text>
+          <ChargeChartECharts order={order} highlights={highlights} height={260} />
         </div>
-      </section>
+      )
+    })
+    .filter(Boolean)
+
+  const content = (
+    <div style={{ minWidth: 280 }}>
+      {m.blocked && (
+        <Space style={{ marginBottom: 8 }}>
+          <WarningFilled style={{ color: '#faad14' }} />
+          <Typography.Text type="warning">
+            内容安全审核未通过 ({m.blocked.stage}/{m.blocked.label || m.blocked.reason})
+          </Typography.Text>
+        </Space>
+      )}
+      {m.toolInvocations.map((inv) => (
+        <ToolCallCard key={inv.id} invocation={inv} />
+      ))}
+      {m.text && <MarkdownView text={m.text} />}
+      {!m.text && !m.blocked && m.status === 'streaming' && <Spin size="small" />}
+      {charts}
     </div>
+  )
+
+  return (
+    <Bubble
+      key={m.id}
+      placement="start"
+      avatar={<Avatar icon={<RobotOutlined />} style={{ background: '#52c41a' }} />}
+      content={content}
+    />
   )
 }

@@ -11,6 +11,19 @@ class ChatStreamRequest(BaseModel):
     example_key: str | None = None
 
 
+class AgentChatMessage(BaseModel):
+    role: str = Field(min_length=1)
+    content: str = ""
+
+
+class AgentChatRequest(BaseModel):
+    """Payload for /api/chat/agent/stream — multi-turn conversation with tools."""
+
+    messages: list[AgentChatMessage] = Field(default_factory=list)
+    user_phone: str | None = Field(default=None, description="若希望工具基于另一手机号查询，可在此提供。")
+    system_prompt: str | None = None
+
+
 class ChatCompletionMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
 

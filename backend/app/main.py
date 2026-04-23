@@ -11,6 +11,7 @@ from app.api.charge import router as charge_router
 from app.api.chat import router as chat_router
 from app.api.chat import v1_router as v1_chat_router
 from app.api.datasets import router as datasets_router
+from app.api.meta import router as meta_router
 from app.core.config import Settings, get_settings
 from app.core.security import generate_access_token
 from app.db.session import build_engine, build_session_factory, init_db
@@ -70,6 +71,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(chat_router, prefix="/api")
     app.include_router(v1_chat_router, prefix="/api")
     app.include_router(datasets_router, prefix="/api")
+    app.include_router(meta_router, prefix="/api")
 
     return app
 

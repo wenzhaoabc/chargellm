@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.security import mask_phone
 from app.db.session import get_db
 from app.schemas.auth import (
     AdminLoginRequest,
@@ -15,8 +16,9 @@ from app.schemas.auth import (
     SmsSendRequest,
     SmsSendResponse,
 )
-from app.services.auth_service import authenticate_admin, authenticate_sms_user, issue_phone_access_token, send_sms_code
+from app.services.auth_service import authenticate_admin, ensure_user_for_phone, issue_phone_access_token
 from app.services.invite_service import start_demo_session
+from app.services.sms_service import consume_sms_code, issue_sms_code
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -45,21 +47,19 @@ def invite_start(payload: InviteStartRequest, db: Session = Depends(get_db)) -> 
 
 
 @router.post("/sms/send", response_model=SmsSendResponse)
-def sms_send(payload: SmsSendRequest) -> SmsSendResponse:
-    settings = get_settings()
-    result = send_sms_code(payload.phone, settings.sms_mock_code)
-    return SmsSendResponse(**result)
+def sms_send(payload: SmsSendRequest, db: Session = Depends(get_db)) -> SmsSendResponse:
+    record = issue_sms_code(db, payload.phone)
+    return SmsSendResponse(phone_masked=mask_phone(payload.phone), mock_code=record.code)
 
 
 @router.post("/sms/login", response_model=SmsLoginResponse)
 def sms_login(payload: SmsLoginRequest, db: Session = Depends(get_db)) -> SmsLoginResponse:
-    settings = get_settings()
-    user = authenticate_sms_user(db, payload.phone, payload.code, settings.sms_mock_code)
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="sms_code_invalid")
+    if not consume_sms_code(db, payload.phone):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="sms_code_expired_or_missing")
+    ensure_user_for_phone(db, payload.phone)
     return SmsLoginResponse(
         access_token=issue_phone_access_token(payload.phone),
-        phone_masked=payload.phone[:3] + "****" + payload.phone[-4:] if len(payload.phone) >= 7 else payload.phone,
+        phone_masked=mask_phone(payload.phone),
     )
 
 
